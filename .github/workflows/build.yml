@@ -14,7 +14,11 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04 on 2026-10-20, where steamcmd (a
+    # 32-bit binary) can no longer open sockets (CreateBoundSocket error 38,
+    # "FAILED (No Connection)"). Every build from 2026-10-20 failed. 24.04 was
+    # the last runner image that worked.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
