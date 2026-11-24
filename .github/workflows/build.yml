@@ -2,18 +2,126 @@ name: Build Rust+Oxide Image
 
 on:
   schedule:
-    # Nightly at 03:00 UTC — before servers check for updates at 03:00
+    # Poll: cheap check, rebuilds only if Steam's Rust build or the Oxide
+    # release has moved past what the published image was built from, so a
+    # Facepunch patch reaches the registry within ~35 minutes instead of the
+    # next night. Off-the-hour minutes on purpose: GitHub delays scheduled
+    # runs at the top of every hour (the 02:00 job has started hours late).
+    - cron: '17,47 * * * *'
+    # Nightly: unconditional rebuild as a backstop (base image, dependency
+    # and SteamCMD refresh), and the keepalive heartbeat below.
     - cron: '0 2 * * *'
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      poll_only:
+        description: "Behave like a poll run: build only if Steam/Oxide changed"
+        type: boolean
+        default: false
+
+# Never run two builds at once; queue instead of cancelling a push in flight.
+concurrency:
+  group: build-image
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # Must match the poll cron above: it is how a run knows it was a poll.
+  POLL_CRON: '17,47 * * * *'
 
 jobs:
+  check:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      rust_build: ${{ steps.versions.outputs.rust_build }}
+      oxide_tag: ${{ steps.versions.outputs.oxide_tag }}
+      image_tag: ${{ steps.versions.outputs.image_tag }}
+    steps:
+      - name: Look up current Rust build and Oxide release
+        id: versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OXIDE_TAG=$(gh api repos/OxideMod/Oxide.Rust/releases/latest --jq .tag_name)
+          # Public Steam build id of the Rust dedicated server (app 258550) via
+          # the steamcmd.net mirror: no Steam login, and unlike Steam's own
+          # UpToDateCheck API it actually returns the build.
+          RUST_BUILD=$(curl -fsS --retry 3 --retry-delay 5 --max-time 30 \
+            https://api.steamcmd.net/v1/info/258550 \
+            | jq -r '.data["258550"].depots.branches.public.buildid // empty' || true)
+          if [ -z "$RUST_BUILD" ]; then
+            echo "::warning::Could not read the Rust build id from api.steamcmd.net"
+          fi
+          echo "oxide_tag=$OXIDE_TAG" >> "$GITHUB_OUTPUT"
+          echo "rust_build=${RUST_BUILD:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=rust-${RUST_BUILD:-unknown}-oxide-${OXIDE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Rust build: ${RUST_BUILD:-unknown}   Oxide: $OXIDE_TAG"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUST_BUILD: ${{ steps.versions.outputs.rust_build }}
+          IMAGE_TAG: ${{ steps.versions.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          POLL=false
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "${POLL_CRON}" ]; then POLL=true; fi
+          if [ "${{ inputs.poll_only }}" = "true" ]; then POLL=true; fi
+
+          if [ "$POLL" != "true" ]; then
+            echo "Not a poll run (${{ github.event_name }}): building unconditionally."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$RUST_BUILD" = "unknown" ]; then
+            echo "::warning::Rust build unknown, skipping this poll (the nightly build is the backstop)."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Back off after a recent failure, so a persistent problem (Steam
+          # down, runner change) is retried every few hours instead of every
+          # poll, which would mean a failure email every 30 minutes.
+          LAST_FAIL=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build.yml \
+            --status failure --limit 1 --json createdAt --jq '.[0].createdAt // empty')
+          if [ -n "$LAST_FAIL" ]; then
+            AGE=$(( $(date +%s) - $(date -d "$LAST_FAIL" +%s) ))
+            if [ "$AGE" -lt 10800 ]; then
+              echo "A run failed ${AGE}s ago: backing off, not building on this poll."
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          REF="${REGISTRY}/${IMAGE_NAME,,}:${IMAGE_TAG}"
+          if docker manifest inspect "$REF" > /dev/null 2>&1; then
+            echo "$REF is already published: nothing to build."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$REF is not published: build needed."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build-and-push:
+    needs: check
+    if: needs.check.outputs.build == 'true'
     # Pinned: ubuntu-latest moved to 26.04 on 2026-10-20, where steamcmd (a
     # 32-bit binary) can no longer open sockets (CreateBoundSocket error 38,
     # "FAILED (No Connection)"). Every build from 2026-10-20 failed. 24.04 was
@@ -27,19 +135,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Fetch latest Oxide release URL
+      - name: Fetch Oxide release URL
         id: oxide
         env:
           # Authenticated: unauthenticated API calls share a 60/hour limit per
           # runner IP, and the old unauthenticated curl swallowed the error body
           # (it died with an opaque KeyError: 'assets').
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The exact release the check job tagged this build with.
+          OXIDE_TAG: ${{ needs.check.outputs.oxide_tag }}
         run: |
           set -euo pipefail
-          OXIDE_URL=$(gh api repos/OxideMod/Oxide.Rust/releases/latest \
+          OXIDE_URL=$(gh api "repos/OxideMod/Oxide.Rust/releases/tags/${OXIDE_TAG}" \
             --jq '[.assets[] | select(.name | test("linux"; "i")) | .browser_download_url][0] // ""')
           if [ -z "$OXIDE_URL" ]; then
-            echo "::error::No linux asset found on the latest Oxide.Rust release"
+            echo "::error::No linux asset found on Oxide.Rust release ${OXIDE_TAG}"
             exit 1
           fi
           echo "url=$OXIDE_URL" >> "$GITHUB_OUTPUT"
@@ -60,6 +170,13 @@ jobs:
           tags: |
             type=raw,value=latest
             type=raw,value={{date 'YYYY-MM-DD'}}
+            type=raw,value=${{ needs.check.outputs.image_tag }}
+          # Which Steam build and Oxide release this image contains. Game servers
+          # compare the Rust build label of the pulled image against the one
+          # they are running to decide whether a restart is needed.
+          labels: |
+            io.skilty.rust.buildid=${{ needs.check.outputs.rust_build }}
+            io.skilty.oxide.version=${{ needs.check.outputs.oxide_tag }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -70,3 +187,67 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             OXIDE_ZIP_FILE_URL=${{ steps.oxide.outputs.url }}
+
+  prune:
+    # Keep the registry from filling up: retain the newest KEEP distinct
+    # Rust/Oxide releases (plus whatever holds `latest`) and delete the rest,
+    # one whole build at a time. See .github/scripts/prune_versions.py for why
+    # it never deletes single versions. A cleanup hiccup must not fail the run.
+    needs: build-and-push
+    if: needs.build-and-push.result == 'success'
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    permissions:
+      contents: read
+      packages: write
+    env:
+      KEEP: '3'
+      # Dry run until the plan has been reviewed once against the real package.
+      PRUNE_DRY_RUN: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trim old image versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OWNER="${IMAGE_NAME%%/*}"
+          PKG="$(basename "${IMAGE_NAME,,}")"
+          gh api "users/${OWNER}/packages/container/${PKG}/versions?per_page=100" --paginate > versions.json
+          # pipefail: if the script refuses (exit 2) we stop here, before any delete.
+          python3 .github/scripts/prune_versions.py < versions.json | tee plan.txt
+          if [ "$PRUNE_DRY_RUN" = "true" ]; then
+            echo "DRY RUN: nothing deleted."
+            exit 0
+          fi
+          grep '^DELETE ' plan.txt | awk '{print $2}' | while read -r id; do
+            echo "deleting version $id"
+            gh api -X DELETE "users/${OWNER}/packages/container/${PKG}/versions/${id}"
+          done
+
+  keepalive:
+    # GitHub disables scheduled workflows in a public repo after 60 days with
+    # no repository activity. That is what silently stopped the nightly build
+    # from 2026-06-06 until it was re-enabled by hand. An empty commit when the
+    # repo has been quiet for 40+ days counts as activity. Pushes made with
+    # GITHUB_TOKEN do not trigger other workflows, so this does not cause a
+    # build. Not yet proven over a full 60 days; failures here never fail the run.
+    if: github.event_name == 'schedule' && github.event.schedule == '0 2 * * *'
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commit a heartbeat if the repo has been quiet
+        run: |
+          set -euo pipefail
+          AGE=$(( $(date +%s) - $(git log -1 --format=%ct) ))
+          if [ "$AGE" -gt 3456000 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive (prevent scheduled-workflow auto-disable)"
+            git push
+          else
+            echo "Last commit is $(( AGE / 86400 )) days old: no heartbeat needed."
+          fi
