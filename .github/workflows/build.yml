@@ -29,14 +29,19 @@ jobs:
 
       - name: Fetch latest Oxide release URL
         id: oxide
+        env:
+          # Authenticated: unauthenticated API calls share a 60/hour limit per
+          # runner IP, and the old unauthenticated curl swallowed the error body
+          # (it died with an opaque KeyError: 'assets').
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          OXIDE_URL=$(curl -s https://api.github.com/repos/OxideMod/Oxide.Rust/releases/latest \
-            | python3 -c "
-          import sys, json
-          assets = json.load(sys.stdin)['assets']
-          urls = [a['browser_download_url'] for a in assets if 'linux' in a['name'].lower()]
-          print(urls[0] if urls else '')
-          ")
+          set -euo pipefail
+          OXIDE_URL=$(gh api repos/OxideMod/Oxide.Rust/releases/latest \
+            --jq '[.assets[] | select(.name | test("linux"; "i")) | .browser_download_url][0] // ""')
+          if [ -z "$OXIDE_URL" ]; then
+            echo "::error::No linux asset found on the latest Oxide.Rust release"
+            exit 1
+          fi
           echo "url=$OXIDE_URL" >> "$GITHUB_OUTPUT"
           echo "Oxide URL: $OXIDE_URL"
 
