@@ -28,8 +28,8 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  # Must match the poll cron above: it is how a run knows it was a poll.
-  POLL_CRON: '17,47 * * * *'
+  # Must match the nightly cron above: it is how a run knows it was NOT a poll.
+  NIGHTLY_CRON: '0 2 * * *'
 
 jobs:
   check:
@@ -81,7 +81,11 @@ jobs:
         run: |
           set -euo pipefail
           POLL=false
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "${POLL_CRON}" ]; then POLL=true; fi
+          # Any scheduled run that is not the nightly is a poll. (Deliberately
+          # not matching the poll cron itself: if the schedule string ever
+          # failed to compare equal, the safe failure is the nightly building
+          # as a poll, not a poll rebuilding the image every 30 minutes.)
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" != "${NIGHTLY_CRON}" ]; then POLL=true; fi
           if [ "${{ inputs.poll_only }}" = "true" ]; then POLL=true; fi
 
           if [ "$POLL" != "true" ]; then
